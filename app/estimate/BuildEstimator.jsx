@@ -53,6 +53,23 @@ function calcEst(rooms, sizes, finish) {
 function fmt(n) { return n >= 1000000 ? `$${(n / 1e6).toFixed(1)}m` : `$${Math.round(n / 1000)}k`; }
 function fmtFull(n) { return '$' + n.toLocaleString('en-AU'); }
 
+// ─── Google Places loader ─────────────────────────────────────────────────────
+const GMAPS_KEY = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY || '';
+let _mapsPromise = null;
+function loadGoogleMapsPlaces() {
+    if (typeof window === 'undefined') return Promise.resolve();
+    if (window.google?.maps?.places) return Promise.resolve();
+    if (_mapsPromise) return _mapsPromise;
+    _mapsPromise = new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(GMAPS_KEY)}&libraries=places&v=weekly`;
+        s.async = true; s.defer = true;
+        s.onload = resolve; s.onerror = reject;
+        document.head.appendChild(s);
+    });
+    return _mapsPromise;
+}
+
 // ─── Count-up hook ────────────────────────────────────────────────────────────
 function useCountUp(target, dur = 800) {
     const [v, setV] = useState(target);
@@ -201,6 +218,30 @@ function S0({ onStart }) {
 function S1({ data, onChange, onContinue, onBack }) {
     const [q, setQ] = useState(data.address || '');
     const [done, setDone] = useState(!!data.propertyData);
+    const inputRef = useRef(null);
+
+    useEffect(() => {
+        let listener = null;
+        loadGoogleMapsPlaces().then(() => {
+            if (!inputRef.current || !window.google?.maps?.places) return;
+            const ac = new window.google.maps.places.Autocomplete(inputRef.current, {
+                fields: ['formatted_address', 'geometry', 'place_id'],
+                componentRestrictions: { country: ['au'] },
+            });
+            listener = ac.addListener('place_changed', () => {
+                const place = ac.getPlace();
+                const addr = place?.formatted_address || q;
+                setQ(addr);
+                onChange({
+                    address: addr,
+                    propertyData: { landArea: '380 m²', yearBuilt: '1965', dwelling: 'Terrace', storeys: '2', council: 'Inner West Council', zone: 'R2 Low Density' },
+                });
+                setDone(true);
+            });
+        }).catch(() => {});
+        return () => { if (listener) listener.remove(); };
+    }, []); // eslint-disable-line
+
     const lookup = () => {
         onChange({ address: q, propertyData: { landArea: '380 m²', yearBuilt: '1965', dwelling: 'Terrace', storeys: '2', council: 'Inner West Council', zone: 'R2 Low Density' } });
         setDone(true);
@@ -211,11 +252,12 @@ function S1({ data, onChange, onContinue, onBack }) {
         <H1 sub="We'll look up your property details automatically.">What's the address?</H1>
         <div style={{ flex: 1, padding: '20px 22px 0', overflowY: 'auto' }}>
             <div style={{ background: C.white, border: `1.5px solid ${q.length > 4 ? C.blue : C.hair}`, borderRadius: 14, padding: '0 16px', height: 52, display: 'flex', alignItems: 'center', gap: 10, transition: 'border-color .15s' }}>
-                <input value={q} onChange={e => { setQ(e.target.value); setDone(false); onChange({ address: e.target.value, propertyData: null }); }} onKeyDown={e => e.key === 'Enter' && q.length > 4 && lookup()} placeholder="Start typing your address…" style={{ flex: 1, border: 'none', background: 'transparent', fontFamily: F.display, fontSize: 16, color: C.ink }} />
+                <input ref={inputRef} value={q} onChange={e => { setQ(e.target.value); setDone(false); onChange({ address: e.target.value, propertyData: null }); }} onKeyDown={e => e.key === 'Enter' && q.length > 4 && lookup()} placeholder="Start typing your address…" style={{ flex: 1, border: 'none', background: 'transparent', fontFamily: F.display, fontSize: 16, color: C.ink }} />
                 {q.length > 4 && !done && <div onClick={lookup} style={{ color: C.blue, fontFamily: F.body, fontSize: 13, fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap' }}>Look up</div>}
             </div>
             {done && data.propertyData && <div style={{ marginTop: 12, background: C.blueSoft, border: `1px solid ${C.blue}25`, borderRadius: 14, padding: '13px 15px' }}>
-                <div style={{ fontFamily: F.body, fontSize: 12, color: C.blue, fontWeight: 600, marginBottom: 9 }}>✓ Property confirmed</div>
+                <div style={{ fontFamily: F.body, fontSize: 12, color: C.blue, fontWeight: 600, marginBottom: 6 }}>✓ Property confirmed</div>
+                <div style={{ fontFamily: F.body, fontSize: 14, color: C.ink, fontWeight: 500, marginBottom: 10, lineHeight: '19px' }}>{data.address}</div>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '5px 14px' }}>
                     {[['Land area', data.propertyData.landArea], ['Year built', data.propertyData.yearBuilt], ['Dwelling', data.propertyData.dwelling], ['Council', data.propertyData.council]].map(([k, v]) => (
                         <div key={k} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, padding: '2px 0', fontFamily: F.body }}><span style={{ color: C.ink3 }}>{k}</span><span style={{ color: C.blue, fontWeight: 500 }}>{v}</span></div>
@@ -224,7 +266,11 @@ function S1({ data, onChange, onContinue, onBack }) {
                 <div style={{ marginTop: 10, paddingTop: 10, borderTop: `1px solid ${C.blue}20`, display: 'flex', justifyContent: 'space-between', fontFamily: F.body, fontSize: 13 }}><span style={{ color: C.ink3 }}>Project type</span><span style={{ color: C.blue, fontWeight: 600 }}>Renovation ✓</span></div>
             </div>}
         </div>
-        <BRow><Btn color={C.blue} onClick={onContinue} disabled={!q || q.length < 4}>{done ? 'Looks right — continue' : 'Continue'}</Btn><div style={{ textAlign: 'center', fontFamily: F.body, fontSize: 12, color: C.ink3 }}>No account needed · Your data is never sold</div></BRow>
+        <BRow>
+            <Btn color={C.blue} onClick={onContinue} disabled={!q || q.length < 4}>{done ? 'Looks right — continue' : 'Continue'}</Btn>
+            <Ghost onClick={onBack}>Previous step</Ghost>
+            <div style={{ textAlign: 'center', fontFamily: F.body, fontSize: 12, color: C.ink3 }}>No account needed · Your data is never sold</div>
+        </BRow>
         <HBar />
     </div>;
 }
@@ -246,7 +292,7 @@ function S2({ data, onChange, onContinue, onBack }) {
                 {data.projectScope === 'whole' && '→ All rooms available. Full internal renovation.'}
             </div>}
         </div>
-        <BRow><Btn color={C.blue} onClick={onContinue} disabled={!data.projectScope}>Continue</Btn></BRow>
+        <BRow><Btn color={C.blue} onClick={onContinue} disabled={!data.projectScope}>Continue</Btn><Ghost onClick={onBack}>Previous step</Ghost></BRow>
         <HBar />
     </div>;
 }
@@ -270,7 +316,7 @@ function S3({ data, onChange, onContinue, onBack }) {
             {rooms.length > 0 && <div style={{ height: 64 }} />}
         </div>
         {rooms.length > 0 && <RunningPill lo={lo} hi={hi} />}
-        <BRow><Btn color={C.blue} onClick={onContinue} disabled={rooms.length === 0}>Continue with {rooms.length} room{rooms.length !== 1 ? 's' : ''}</Btn></BRow>
+        <BRow><Btn color={C.blue} onClick={onContinue} disabled={rooms.length === 0}>Continue with {rooms.length} room{rooms.length !== 1 ? 's' : ''}</Btn><Ghost onClick={onBack}>Previous step</Ghost></BRow>
         <HBar />
     </div>;
 }
@@ -303,13 +349,13 @@ function S4({ data, onChange, onContinue, onBack }) {
             <div style={{ height: 64 }} />
         </div>
         <RunningPill lo={lo} hi={hi} />
-        <BRow><Btn color={C.blue} onClick={onContinue}>Continue</Btn></BRow>
+        <BRow><Btn color={C.blue} onClick={onContinue}>Continue</Btn><Ghost onClick={onBack}>Previous step</Ghost></BRow>
         <HBar />
     </div>;
 }
 
 // 5 · Ballpark reveal (free value moment)
-function S5({ data, onChange, onPay, onSave }) {
+function S5({ data, onChange, onPay, onSave, onBack }) {
     const rooms = data.rooms || [], sizes = data.roomSizes || {}, finish = data.finish || 'standard';
     const [lo, hi] = calcEst(rooms, sizes, finish);
     const aLo = useCountUp(lo, 1200), aHi = useCountUp(hi, 1200);
@@ -374,6 +420,7 @@ function S5({ data, onChange, onPay, onSave }) {
         <div style={{ padding: '8px 22px 14px', display: 'flex', flexDirection: 'column', gap: 8 }}>
             <Btn color={C.orange} onClick={onPay}>Get full report — $29</Btn>
             <Ghost onClick={onSave}>Save ballpark (free)</Ghost>
+            <Ghost onClick={onBack}>Previous step</Ghost>
         </div>
         <HBar />
     </div>;
@@ -444,7 +491,7 @@ function S7({ data, onChange, onContinue, onBack }) {
                 <span style={{ color: C.ink, fontWeight: 500 }}>No document?</span> Tap "Skip" — you'll manually confirm details on the next screen.
             </div>
         </div>
-        <BRow><Btn color={C.blue} onClick={onContinue}>{uploaded ? 'Continue with document' : 'Continue →'}</Btn><Ghost onClick={onContinue}>Skip upload</Ghost></BRow>
+        <BRow><Btn color={C.blue} onClick={onContinue}>{uploaded ? 'Continue with document' : 'Continue →'}</Btn><Ghost onClick={onContinue}>Skip upload</Ghost><Ghost onClick={onBack}>Previous step</Ghost></BRow>
         <HBar />
     </div>;
 }
@@ -472,7 +519,7 @@ function S8({ data, onChange, onContinue, onBack }) {
                 </div>
             </div>
         </div>
-        <BRow><Btn color={C.blue} onClick={onContinue}>Looks right — continue</Btn></BRow>
+        <BRow><Btn color={C.blue} onClick={onContinue}>Looks right — continue</Btn><Ghost onClick={onBack}>Previous step</Ghost></BRow>
         <HBar />
     </div>;
 }
@@ -494,7 +541,7 @@ function S9({ data, onChange, onContinue, onBack }) {
                 <Card style={{ padding: 0, overflow: 'hidden' }}>{restr.map((r, i) => <div key={r.key} style={{ borderBottom: i < restr.length - 1 ? `1px solid ${C.hair}` : 'none' }}><Toggle label={r.label} sub={r.sub} on={!!sc[r.key]} onToggle={() => set(r.key, !sc[r.key])} /></div>)}</Card>
             </div>
         </div>
-        <BRow><Btn color={C.blue} onClick={onContinue} disabled={!sc.access}>Continue</Btn></BRow>
+        <BRow><Btn color={C.blue} onClick={onContinue} disabled={!sc.access}>Continue</Btn><Ghost onClick={onBack}>Previous step</Ghost></BRow>
         <HBar />
     </div>;
 }
@@ -528,7 +575,7 @@ function S10({ data, onChange, onContinue, onBack }) {
                 ⚠️ {cd.heritage ? 'Heritage overlay — additional approval likely required. Estimated permit cost: $3,500–$6,500.' : 'DA required. Estimated cost: $3,200–$5,800 added to report.'}
             </div>}
         </div>
-        <BRow><Btn color={C.blue} onClick={onContinue}>Continue</Btn></BRow>
+        <BRow><Btn color={C.blue} onClick={onContinue}>Continue</Btn><Ghost onClick={onBack}>Previous step</Ghost></BRow>
         <HBar />
     </div>;
 }
@@ -553,7 +600,7 @@ function S11({ data, onChange, onContinue, onBack }) {
                 <Toggle label="Include asbestos provisional" sub="Recommended for pre-1985 builds" on={dm.asbestos !== false} onToggle={() => set('asbestos', !dm.asbestos)} />
             </div>}
         </div>
-        <BRow><Btn color={C.blue} onClick={onContinue}>Continue</Btn></BRow>
+        <BRow><Btn color={C.blue} onClick={onContinue}>Continue</Btn><Ghost onClick={onBack}>Previous step</Ghost></BRow>
         <HBar />
     </div>;
 }
@@ -576,7 +623,7 @@ function S12({ data, onChange, onContinue, onBack }) {
             {opt('staying', '🏠', 'Staying on-site', 'Builder stages work to keep bathrooms and kitchen functional throughout.')}
             {opt('vacating', '🏨', 'Vacating the property', 'Builder has full access. No staging — most cost-efficient approach.')}
         </div>
-        <BRow><Btn color={C.blue} onClick={onContinue} disabled={!ls}>Continue</Btn></BRow>
+        <BRow><Btn color={C.blue} onClick={onContinue} disabled={!ls}>Continue</Btn><Ghost onClick={onBack}>Previous step</Ghost></BRow>
         <HBar />
     </div>;
 }
@@ -597,7 +644,7 @@ function S13({ data, onChange, onContinue, onBack }) {
                 {hasAny ? '✓ Structural costs included as separate line items with provisional ranges.' : 'No structural work? Toggle anything that applies or continue to your report.'}
             </div>
         </div>
-        <BRow><Btn color={C.orange} onClick={onContinue}>Generate my report →</Btn></BRow>
+        <BRow><Btn color={C.orange} onClick={onContinue}>Generate my report →</Btn><Ghost onClick={onBack}>Previous step</Ghost></BRow>
         <HBar />
     </div>;
 }
@@ -769,7 +816,7 @@ export default function BuildEstimator() {
                 {step === 'scope' && <S2 data={form} onChange={up} onContinue={next} onBack={back} />}
                 {step === 'rooms' && <S3 data={form} onChange={up} onContinue={next} onBack={back} />}
                 {step === 'sizing' && <S4 data={form} onChange={up} onContinue={next} onBack={back} />}
-                {step === 'ballpark' && <S5 data={form} onChange={up} onPay={() => goTo('payment')} onSave={() => goTo('savefree')} />}
+                {step === 'ballpark' && <S5 data={form} onChange={up} onPay={() => goTo('payment')} onSave={() => goTo('savefree')} onBack={back} />}
                 {step === 'savefree' && <SSave data={form} onChange={up} onSubmit={next} onBack={() => goTo('ballpark')} />}
                 {step === 'payment' && <S6 data={form} onPaid={() => goTo('upload')} onBack={() => goTo('ballpark')} />}
                 {step === 'upload' && <S7 data={form} onChange={up} onContinue={next} onBack={back} />}
