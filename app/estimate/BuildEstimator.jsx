@@ -14,7 +14,7 @@
  */
 
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { uploadFloorPlan, analyzeFloorPlan } from '../lib/floorPlan';
+import { analyzeFloorPlan } from '../lib/floorPlan';
 
 // ─── Design tokens ────────────────────────────────────────────────────────────
 const C = {
@@ -497,8 +497,7 @@ function S6({ data, onPaid, onBack }) {
 function S7({ data, onChange, onContinue, onBack }) {
     const [imageFile, setImageFile]     = useState(null);
     const [imageUrl, setImageUrl]       = useState(null);   // local object URL
-    const [uploadedUrl, setUploadedUrl] = useState(null);   // Supabase URL
-    const [uploading, setUploading]     = useState(false);
+    const [uploadedUrl, setUploadedUrl] = useState(null);   // server-stored URL
     const [analysing, setAnalysing]     = useState(false);
     const [error, setError]             = useState(null);
     const [result, setResult]           = useState(null);
@@ -596,18 +595,33 @@ function S7({ data, onChange, onContinue, onBack }) {
         });
     }
 
+    async function getImageBase64() {
+        const img = imageRef.current;
+        const MAX = 1568; const scale = Math.min(1, MAX / Math.max(img.naturalWidth, img.naturalHeight));
+        const w = Math.round(img.naturalWidth * scale); const h = Math.round(img.naturalHeight * scale);
+        const canvas = document.createElement('canvas'); canvas.width = w; canvas.height = h;
+        canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+        return new Promise((resolve, reject) => {
+            canvas.toBlob(blob => {
+                if (!blob) { reject(new Error('Failed to encode image')); return; }
+                const reader = new FileReader();
+                reader.onload = () => resolve(reader.result.split(',')[1]);
+                reader.onerror = reject; reader.readAsDataURL(blob);
+            }, 'image/jpeg', 0.88);
+        });
+    }
+
     async function handleAnalyse() {
-        if (!imageFile) return;
+        if (!imageRef.current) return;
         setError(null); setAnalysing(true);
         try {
-            let storedUrl = uploadedUrl;
-            if (!storedUrl) { setUploading(true); storedUrl = await uploadFloorPlan(imageFile); setUploadedUrl(storedUrl); setUploading(false); }
-            const annotated = rects.length > 0 ? await createAnnotatedImage() : undefined;
-            const r = await analyzeFloorPlan(storedUrl, rects, annotated);
+            const imageBase64 = rects.length > 0 ? await createAnnotatedImage() : await getImageBase64();
+            const r = await analyzeFloorPlan(imageBase64, rects, rects.length > 0);
             setResult(r);
+            setUploadedUrl(r.url);
         } catch (e) {
             setError(e.message || 'Analysis failed — please try again.');
-        } finally { setAnalysing(false); setUploading(false); }
+        } finally { setAnalysing(false); }
     }
 
     function handleUseValues() {
@@ -622,7 +636,7 @@ function S7({ data, onChange, onContinue, onBack }) {
         onContinue();
     }
 
-    const isLoading = uploading || analysing;
+    const isLoading = analysing;
     const confColor = result?.confidence === 'high' ? C.green : result?.confidence === 'medium' ? C.amber : '#EF4444';
     const confLabel = result?.confidence === 'high' ? 'High confidence' : result?.confidence === 'medium' ? 'Medium confidence' : 'Low confidence';
 
@@ -687,7 +701,7 @@ function S7({ data, onChange, onContinue, onBack }) {
             {/* Phase 3: loading */}
             {isLoading && <div style={{ border: `1px solid ${C.hair}`, borderRadius: 18, padding: '32px 20px', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 14, background: C.white }}>
                 <div style={{ width: 52, height: 52, borderRadius: 26, border: `3px solid ${C.hair}`, borderTopColor: C.blue, animation: 'spin 1.2s linear infinite' }} />
-                <div style={{ fontFamily: F.display, fontSize: 16, fontWeight: 600, color: C.ink }}>{uploading ? 'Uploading…' : 'AI is sizing your rooms…'}</div>
+                <div style={{ fontFamily: F.display, fontSize: 16, fontWeight: 600, color: C.ink }}>AI is sizing your rooms…</div>
                 <div style={{ fontFamily: F.body, fontSize: 13, color: C.ink3, textAlign: 'center' }}>This takes about 10 seconds</div>
             </div>}
 
