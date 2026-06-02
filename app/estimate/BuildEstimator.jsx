@@ -14,6 +14,7 @@
  */
 
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { uploadFloorPlan, analyzeFloorPlan } from '../lib/floorPlan';
 
 // ─── Design tokens ────────────────────────────────────────────────────────────
 const C = {
@@ -68,6 +69,35 @@ function loadGoogleMapsPlaces() {
         document.head.appendChild(s);
     });
     return _mapsPromise;
+}
+
+// ─── Floor plan annotation ───────────────────────────────────────────────────
+const FLOOR_ROOM_TYPES = [
+    { key: 'bedroom',  label: 'Bedroom',      color: 'rgba(99,149,255,0.35)',  border: '#6395ff' },
+    { key: 'bathroom', label: 'Bathroom',     color: 'rgba(99,200,255,0.35)',  border: '#63c8ff' },
+    { key: 'kitchen',  label: 'Kitchen',      color: 'rgba(255,180,80,0.35)',  border: '#ffb450' },
+    { key: 'living',   label: 'Living',       color: 'rgba(120,200,120,0.35)', border: '#78c878' },
+    { key: 'deck',     label: 'Deck/Outdoor', color: 'rgba(200,160,100,0.35)', border: '#c8a064' },
+    { key: 'other',    label: 'Other',        color: 'rgba(180,120,220,0.35)', border: '#b478dc' },
+];
+
+// Map AI-detected rooms onto buildestimate roomSizes (only for rooms already in scope)
+function mapAIRoomsToSizes(aiRooms, selectedRooms) {
+    const counts = {};
+    const sizes = {};
+    for (const r of aiRooms) {
+        const n = (counts[r.type] = (counts[r.type] || 0) + 1);
+        const area = Math.max(1, Math.round(r.area_sqm));
+        if (r.type === 'kitchen'  && selectedRooms.includes('kitchen'))   sizes.kitchen   = area;
+        if (r.type === 'living'   && selectedRooms.includes('living'))    sizes.living    = area;
+        if (r.type === 'bathroom' && n === 1 && selectedRooms.includes('bathroom'))  sizes.bathroom  = area;
+        if (r.type === 'bathroom' && n === 2 && selectedRooms.includes('ensuite'))   sizes.ensuite   = area;
+        if (r.type === 'bedroom'  && n === 1 && selectedRooms.includes('masterBed')) sizes.masterBed = area;
+        if (r.type === 'bedroom'  && n === 2 && selectedRooms.includes('bed2'))      sizes.bed2      = area;
+        if (r.type === 'bedroom'  && n === 3 && selectedRooms.includes('bed3'))      sizes.bed3      = area;
+        if (r.type === 'deck'     && selectedRooms.includes('alfresco'))  sizes.alfresco  = area;
+    }
+    return sizes;
 }
 
 // ─── Count-up hook ────────────────────────────────────────────────────────────
@@ -463,35 +493,233 @@ function S6({ data, onPaid, onBack }) {
     </div>;
 }
 
-// 7 · Document upload
+// 7 · Floor plan upload (real — Supabase storage + Claude AI analysis)
 function S7({ data, onChange, onContinue, onBack }) {
-    const [uploaded, setUploaded] = useState(!!data.hasDocument);
-    const [processing, setProcessing] = useState(false);
-    const handle = () => { setProcessing(true); setTimeout(() => { setProcessing(false); setUploaded(true); onChange({ hasDocument: true, docName: 'floor-plan.pdf' }); }, 1800); };
+    const [imageFile, setImageFile]     = useState(null);
+    const [imageUrl, setImageUrl]       = useState(null);   // local object URL
+    const [uploadedUrl, setUploadedUrl] = useState(null);   // Supabase URL
+    const [uploading, setUploading]     = useState(false);
+    const [analysing, setAnalysing]     = useState(false);
+    const [error, setError]             = useState(null);
+    const [result, setResult]           = useState(null);
+
+    const [rects, setRects]               = useState([]);
+    const [activeType, setActiveType]     = useState('bedroom');
+    const [drawing, setDrawing]           = useState(false);
+    const [dragStart, setDragStart]       = useState(null);
+    const [currentRect, setCurrentRect]   = useState(null);
+
+    const canvasRef   = useRef(null);
+    const imageRef    = useRef(null);
+    const fileInputRef = useRef(null);
+
+    const redraw = useCallback(() => {
+        const canvas = canvasRef.current;
+        const img = imageRef.current;
+        if (!canvas || !img) return;
+        const ctx = canvas.getContext('2d');
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        for (const r of rects) {
+            ctx.fillStyle = r.color; ctx.strokeStyle = r.borderColor; ctx.lineWidth = 2;
+            ctx.fillRect(r.x, r.y, r.width, r.height);
+            ctx.strokeRect(r.x, r.y, r.width, r.height);
+            const rt = FLOOR_ROOM_TYPES.find(t => t.key === r.type);
+            ctx.fillStyle = r.borderColor; ctx.font = 'bold 11px sans-serif';
+            ctx.fillText(rt?.label ?? r.type, r.x + 4, r.y + 15);
+        }
+        if (currentRect) {
+            const rt = FLOOR_ROOM_TYPES.find(t => t.key === activeType);
+            ctx.fillStyle = rt?.color ?? 'rgba(99,149,255,0.35)';
+            ctx.strokeStyle = rt?.border ?? '#6395ff'; ctx.lineWidth = 2;
+            ctx.setLineDash([6, 3]);
+            ctx.fillRect(currentRect.x, currentRect.y, currentRect.width, currentRect.height);
+            ctx.strokeRect(currentRect.x, currentRect.y, currentRect.width, currentRect.height);
+            ctx.setLineDash([]);
+        }
+    }, [rects, currentRect, activeType]);
+
+    useEffect(() => { redraw(); }, [redraw]);
+
+    function canvasPos(e) {
+        const c = canvasRef.current; const r = c.getBoundingClientRect();
+        return { x: (e.clientX - r.left) * (c.width / r.width), y: (e.clientY - r.top) * (c.height / r.height) };
+    }
+    function touchPos(e) {
+        const c = canvasRef.current; const r = c.getBoundingClientRect(); const t = e.touches[0];
+        return { x: (t.clientX - r.left) * (c.width / r.width), y: (t.clientY - r.top) * (c.height / r.height) };
+    }
+    function startDraw(pos) { setDrawing(true); setDragStart(pos); setCurrentRect({ x: pos.x, y: pos.y, width: 0, height: 0 }); }
+    function moveDraw(pos) {
+        if (!drawing || !dragStart) return;
+        setCurrentRect({ x: Math.min(dragStart.x, pos.x), y: Math.min(dragStart.y, pos.y), width: Math.abs(pos.x - dragStart.x), height: Math.abs(pos.y - dragStart.y) });
+    }
+    function endDraw() {
+        if (!drawing || !currentRect || currentRect.width < 10 || currentRect.height < 10) { setDrawing(false); setCurrentRect(null); return; }
+        const rt = FLOOR_ROOM_TYPES.find(t => t.key === activeType);
+        setRects(prev => [...prev, { id: crypto.randomUUID(), ...currentRect, type: activeType, color: rt.color, borderColor: rt.border }]);
+        setDrawing(false); setCurrentRect(null);
+    }
+
+    function handleFile(file) {
+        if (file.size > 5 * 1024 * 1024) { setError('Image too large — please use an image under 5 MB.'); return; }
+        setError(null); setResult(null); setRects([]); setImageFile(file); setUploadedUrl(null);
+        const url = URL.createObjectURL(file);
+        setImageUrl(url);
+        const img = new Image();
+        img.onload = () => {
+            imageRef.current = img;
+            const c = canvasRef.current;
+            if (c) { c.width = img.naturalWidth; c.height = img.naturalHeight; redraw(); }
+        };
+        img.src = url;
+    }
+
+    async function createAnnotatedImage() {
+        const img = imageRef.current;
+        const MAX = 1568; const scale = Math.min(1, MAX / Math.max(img.naturalWidth, img.naturalHeight));
+        const w = Math.round(img.naturalWidth * scale); const h = Math.round(img.naturalHeight * scale);
+        const off = document.createElement('canvas'); off.width = w; off.height = h;
+        const ctx = off.getContext('2d'); ctx.drawImage(img, 0, 0, w, h);
+        for (const r of rects) {
+            ctx.fillStyle = r.color; ctx.strokeStyle = r.borderColor; ctx.lineWidth = 3;
+            ctx.fillRect(r.x * scale, r.y * scale, r.width * scale, r.height * scale);
+            ctx.strokeRect(r.x * scale, r.y * scale, r.width * scale, r.height * scale);
+        }
+        return new Promise((resolve, reject) => {
+            off.toBlob(blob => {
+                if (!blob) { reject(new Error('Failed to create annotated image')); return; }
+                const reader = new FileReader();
+                reader.onload = () => resolve(reader.result.split(',')[1]);
+                reader.onerror = reject; reader.readAsDataURL(blob);
+            }, 'image/jpeg', 0.88);
+        });
+    }
+
+    async function handleAnalyse() {
+        if (!imageFile) return;
+        setError(null); setAnalysing(true);
+        try {
+            let storedUrl = uploadedUrl;
+            if (!storedUrl) { setUploading(true); storedUrl = await uploadFloorPlan(imageFile); setUploadedUrl(storedUrl); setUploading(false); }
+            const annotated = rects.length > 0 ? await createAnnotatedImage() : undefined;
+            const r = await analyzeFloorPlan(storedUrl, rects, annotated);
+            setResult(r);
+        } catch (e) {
+            setError(e.message || 'Analysis failed — please try again.');
+        } finally { setAnalysing(false); setUploading(false); }
+    }
+
+    function handleUseValues() {
+        if (!result || !uploadedUrl) return;
+        const mappedSizes = mapAIRoomsToSizes(result.rooms, data.rooms || []);
+        onChange({
+            floorPlanData: { imageUrl: uploadedUrl, result },
+            hasDocument: true,
+            docName: imageFile?.name || 'floor-plan.jpg',
+            roomSizes: { ...(data.roomSizes || {}), ...mappedSizes },
+        });
+        onContinue();
+    }
+
+    const isLoading = uploading || analysing;
+    const confColor = result?.confidence === 'high' ? C.green : result?.confidence === 'medium' ? C.amber : '#EF4444';
+    const confLabel = result?.confidence === 'high' ? 'High confidence' : result?.confidence === 'medium' ? 'Medium confidence' : 'Low confidence';
+
     return <div className="BEs" style={{ background: C.paper }}>
         <SBar /><PBar step={1} total={7} color={C.orange} />
         <NavRow onBack={onBack} stepIdx={0} totalSteps={7} color={C.orange} />
-        <H1 sub="Optional — AI will extract room sizes and layout. You can always skip.">Upload a floor plan</H1>
-        <div style={{ flex: 1, padding: '22px 22px 0' }}>
-            {!uploaded && !processing && <div onClick={handle} style={{ border: `2px dashed ${C.hair}`, borderRadius: 18, padding: '32px 20px', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12, cursor: 'pointer', background: C.white }}>
-                <div style={{ width: 52, height: 52, borderRadius: 14, background: C.blueSoft, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 24 }}>📄</div>
-                <div style={{ fontFamily: F.display, fontSize: 16, fontWeight: 600, color: C.ink }}>Tap to upload</div>
-                <div style={{ fontFamily: F.body, fontSize: 13, color: C.ink3, textAlign: 'center' }}>Floor plan or building report — PDF, PNG or JPG</div>
+        <H1 sub="Upload your floor plan, draw over the rooms you're renovating, then let AI size them.">Upload a floor plan</H1>
+
+        <div style={{ flex: 1, padding: '16px 22px 0', overflowY: 'auto' }}>
+
+            {/* Phase 1: no image */}
+            {!imageUrl && <div>
+                <div onClick={() => fileInputRef.current?.click()} style={{ border: `2px dashed ${C.hair}`, borderRadius: 18, padding: '32px 20px', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12, cursor: 'pointer', background: C.white }}>
+                    <div style={{ width: 52, height: 52, borderRadius: 14, background: C.blueSoft, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 24 }}>🗺️</div>
+                    <div style={{ fontFamily: F.display, fontSize: 16, fontWeight: 600, color: C.ink }}>Tap to upload floor plan</div>
+                    <div style={{ fontFamily: F.body, fontSize: 13, color: C.ink3, textAlign: 'center' }}>JPG, PNG or WebP · Max 5 MB</div>
+                </div>
+                <input ref={fileInputRef} type="file" accept="image/jpeg,image/png,image/webp" style={{ display: 'none' }} onChange={e => { const f = e.target.files?.[0]; if (f) handleFile(f); }} />
+                <div style={{ marginTop: 14, padding: '13px 15px', background: 'rgba(255,255,255,.6)', border: `1px dashed ${C.hair}`, borderRadius: 12, fontFamily: F.body, fontSize: 13, color: C.ink2, lineHeight: '19px' }}>
+                    <span style={{ color: C.ink, fontWeight: 500 }}>No floor plan?</span> Tap "Skip" — you'll confirm room sizes manually.
+                </div>
             </div>}
-            {processing && <div style={{ border: `1px solid ${C.hair}`, borderRadius: 18, padding: '32px 20px', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 14, background: C.white }}>
+
+            {/* Phase 2: image loaded — annotation canvas */}
+            {imageUrl && !result && !isLoading && <div>
+                {/* Room type chips */}
+                <div style={{ marginBottom: 10 }}>
+                    <div style={{ fontFamily: F.body, fontSize: 11, color: C.ink3, textTransform: 'uppercase', letterSpacing: .5, fontWeight: 600, marginBottom: 7 }}>Select room type then draw over it</div>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                        {FLOOR_ROOM_TYPES.map(rt => <div key={rt.key} onClick={() => setActiveType(rt.key)} style={{ padding: '6px 12px', borderRadius: 100, border: `1.5px solid ${rt.border}`, background: activeType === rt.key ? rt.border : 'transparent', color: activeType === rt.key ? '#fff' : C.ink, fontFamily: F.body, fontSize: 13, fontWeight: 500, cursor: 'pointer', transition: 'all .12s' }}>{rt.label}</div>)}
+                    </div>
+                </div>
+
+                {/* Canvas */}
+                <div style={{ borderRadius: 14, overflow: 'hidden', border: `1px solid ${C.hair}`, background: C.white, maxHeight: 260, display: 'flex', alignItems: 'center' }}>
+                    <canvas ref={canvasRef} style={{ width: '100%', height: 'auto', display: 'block', cursor: 'crosshair', touchAction: 'none', maxHeight: 260, objectFit: 'contain' }}
+                        onMouseDown={e => startDraw(canvasPos(e))}
+                        onMouseMove={e => moveDraw(canvasPos(e))}
+                        onMouseUp={endDraw} onMouseLeave={endDraw}
+                        onTouchStart={e => { e.preventDefault(); startDraw(touchPos(e)); }}
+                        onTouchMove={e => { e.preventDefault(); moveDraw(touchPos(e)); }}
+                        onTouchEnd={endDraw}
+                    />
+                </div>
+
+                {/* Drawn rooms */}
+                {rects.length > 0 && <div style={{ marginTop: 10, display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                    {rects.map(r => {
+                        const rt = FLOOR_ROOM_TYPES.find(t => t.key === r.type);
+                        return <div key={r.id} style={{ display: 'flex', alignItems: 'center', gap: 5, padding: '4px 10px', border: `1.5px solid ${rt.border}`, borderRadius: 100, fontFamily: F.body, fontSize: 12, color: C.ink }}>
+                            {rt.label}
+                            <span onClick={() => setRects(prev => prev.filter(x => x.id !== r.id))} style={{ color: C.ink3, cursor: 'pointer', fontWeight: 600, fontSize: 14, lineHeight: 1 }}>×</span>
+                        </div>;
+                    })}
+                </div>}
+
+                <div style={{ marginTop: 8, fontFamily: F.body, fontSize: 12, color: C.ink3 }}>Click and drag to mark rooms · Draw one rectangle per room</div>
+                <div onClick={() => fileInputRef.current?.click()} style={{ marginTop: 8, fontFamily: F.body, fontSize: 12, color: C.blue, cursor: 'pointer', fontWeight: 500 }}>Change image</div>
+                <input ref={fileInputRef} type="file" accept="image/jpeg,image/png,image/webp" style={{ display: 'none' }} onChange={e => { const f = e.target.files?.[0]; if (f) handleFile(f); }} />
+            </div>}
+
+            {/* Phase 3: loading */}
+            {isLoading && <div style={{ border: `1px solid ${C.hair}`, borderRadius: 18, padding: '32px 20px', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 14, background: C.white }}>
                 <div style={{ width: 52, height: 52, borderRadius: 26, border: `3px solid ${C.hair}`, borderTopColor: C.blue, animation: 'spin 1.2s linear infinite' }} />
-                <div style={{ fontFamily: F.display, fontSize: 16, fontWeight: 600, color: C.ink }}>Reading document…</div>
-                <div style={{ fontFamily: F.body, fontSize: 13, color: C.ink3, textAlign: 'center' }}>AI is extracting room sizes and layout details</div>
+                <div style={{ fontFamily: F.display, fontSize: 16, fontWeight: 600, color: C.ink }}>{uploading ? 'Uploading…' : 'AI is sizing your rooms…'}</div>
+                <div style={{ fontFamily: F.body, fontSize: 13, color: C.ink3, textAlign: 'center' }}>This takes about 10 seconds</div>
             </div>}
-            {uploaded && <div style={{ background: C.white, border: `1.5px solid ${C.green}`, borderRadius: 18, padding: '16px 18px', display: 'flex', alignItems: 'center', gap: 14 }}>
-                <div style={{ width: 42, height: 42, borderRadius: 12, background: C.greenSoft, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 20, flexShrink: 0 }}>✓</div>
-                <div><div style={{ fontFamily: F.body, fontSize: 14, fontWeight: 600, color: C.ink }}>{data.docName}</div><div style={{ fontFamily: F.body, fontSize: 12, color: C.green, marginTop: 2 }}>AI extracted room structure — review on next screen</div></div>
+
+            {/* Phase 4: result */}
+            {result && !isLoading && <div>
+                <div style={{ background: C.white, border: `1.5px solid ${C.green}`, borderRadius: 16, padding: '14px 16px', marginBottom: 12 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
+                        <div style={{ width: 32, height: 32, borderRadius: 10, background: C.greenSoft, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 16, flexShrink: 0 }}>✓</div>
+                        <div>
+                            <div style={{ fontFamily: F.display, fontSize: 15, fontWeight: 600, color: C.ink }}>AI estimated ~{Math.round(result.total_area_sqm)} m² total</div>
+                            <div style={{ display: 'inline-flex', alignItems: 'center', gap: 4, marginTop: 3, padding: '2px 8px', background: confColor + '20', border: `1px solid ${confColor}40`, borderRadius: 100, fontFamily: F.body, fontSize: 11, color: confColor, fontWeight: 500 }}>{confLabel}</div>
+                        </div>
+                    </div>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                        {result.rooms.map((r, i) => <div key={i} style={{ padding: '4px 10px', background: C.paper, border: `1px solid ${C.hair}`, borderRadius: 100, fontFamily: F.mono, fontSize: 12, color: C.ink }}>{r.type} · {Math.round(r.area_sqm)} m²</div>)}
+                    </div>
+                    {result.notes && <div style={{ marginTop: 10, fontFamily: F.body, fontSize: 12, color: C.ink3, lineHeight: '17px' }}>{result.notes}</div>}
+                </div>
+                <div onClick={() => setResult(null)} style={{ fontFamily: F.body, fontSize: 12, color: C.blue, cursor: 'pointer', fontWeight: 500, marginBottom: 4 }}>Re-annotate</div>
             </div>}
-            <div style={{ marginTop: 14, padding: '13px 15px', background: 'rgba(255,255,255,.6)', border: `1px dashed ${C.hair}`, borderRadius: 12, fontFamily: F.body, fontSize: 13, color: C.ink2, lineHeight: '19px' }}>
-                <span style={{ color: C.ink, fontWeight: 500 }}>No document?</span> Tap "Skip" — you'll manually confirm details on the next screen.
-            </div>
+
+            {/* Error */}
+            {error && <div style={{ marginTop: 10, padding: '12px 14px', background: '#FEF2F2', border: '1px solid #FECACA', borderRadius: 12, fontFamily: F.body, fontSize: 13, color: '#DC2626', lineHeight: '18px' }}>{error}</div>}
         </div>
-        <BRow><Btn color={C.blue} onClick={onContinue}>{uploaded ? 'Continue with document' : 'Continue →'}</Btn><Ghost onClick={onContinue}>Skip upload</Ghost><Ghost onClick={onBack}>Previous step</Ghost></BRow>
+
+        <BRow>
+            {!imageUrl && <Btn color={C.blue} onClick={onContinue}>Skip — I'll enter sizes manually</Btn>}
+            {imageUrl && !result && !isLoading && <Btn color={C.blue} onClick={handleAnalyse} disabled={isLoading}>Analyse floor plan</Btn>}
+            {result && !isLoading && <Btn color={C.blue} onClick={handleUseValues}>Use these room sizes →</Btn>}
+            {result && !isLoading && <Ghost onClick={onContinue}>Skip — enter sizes manually</Ghost>}
+            <Ghost onClick={onBack}>Previous step</Ghost>
+        </BRow>
         <HBar />
     </div>;
 }
@@ -499,24 +727,64 @@ function S7({ data, onChange, onContinue, onBack }) {
 // 8 · Confirm property details
 function S8({ data, onChange, onContinue, onBack }) {
     const pd = data.propertyData || {};
+    const fp = data.floorPlanData;
     const setF = (k, v) => onChange({ propertyData: { ...pd, [k]: v } });
+    const setSz = (r, v) => onChange({ roomSizes: { ...(data.roomSizes || {}), [r]: v } });
     const fields = [{ key: 'landArea', label: 'Land area', ph: 'e.g. 380 m²' }, { key: 'yearBuilt', label: 'Year built', ph: 'e.g. 1965' }, { key: 'dwelling', label: 'Dwelling type', ph: 'e.g. Terrace' }, { key: 'storeys', label: 'Storeys', ph: 'e.g. 2' }, { key: 'council', label: 'Council', ph: 'e.g. Inner West Council' }];
+    const confColor = fp?.result?.confidence === 'high' ? C.green : fp?.result?.confidence === 'medium' ? C.amber : '#EF4444';
     return <div className="BEs" style={{ background: C.paper }}>
         <SBar /><PBar step={2} total={7} color={C.orange} />
-        <NavRow onBack={onBack} stepIdx={1} totalSteps={7} color={C.orange} right={data.hasDocument ? <AutoBadge label="AI extracted" /> : null} />
-        <H1 sub={data.hasDocument ? 'AI extracted these from your document — correct anything that\'s off.' : 'Review your property details and adjust if needed.'}>Confirm details</H1>
+        <NavRow onBack={onBack} stepIdx={1} totalSteps={7} color={C.orange} right={fp ? <AutoBadge label="AI extracted" /> : null} />
+        <H1 sub={fp ? 'AI sized your rooms from the floor plan — adjust anything that looks off.' : 'Review your property details and adjust if needed.'}>Confirm details</H1>
         <div style={{ flex: 1, padding: '20px 22px 0', overflowY: 'auto' }}>
+
+            {/* AI floor plan result banner */}
+            {fp && <div style={{ marginBottom: 14, background: C.greenSoft, border: `1px solid ${C.green}30`, borderRadius: 14, padding: '12px 14px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
+                    <span style={{ fontSize: 14 }}>✓</span>
+                    <span style={{ fontFamily: F.body, fontSize: 13, fontWeight: 600, color: C.green }}>Floor plan analysed · ~{Math.round(fp.result.total_area_sqm)} m² total</span>
+                    <div style={{ marginLeft: 'auto', padding: '2px 8px', background: confColor + '20', border: `1px solid ${confColor}40`, borderRadius: 100, fontFamily: F.body, fontSize: 10, color: confColor, fontWeight: 500, textTransform: 'uppercase', letterSpacing: .4 }}>{fp.result.confidence}</div>
+                </div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
+                    {fp.result.rooms.map((r, i) => <div key={i} style={{ padding: '3px 9px', background: C.white, border: `1px solid ${C.hair}`, borderRadius: 100, fontFamily: F.mono, fontSize: 11, color: C.ink }}>{r.type} · {Math.round(r.area_sqm)} m²</div>)}
+                </div>
+                {fp.result.notes && <div style={{ marginTop: 8, fontFamily: F.body, fontSize: 11, color: C.ink3, lineHeight: '16px' }}>{fp.result.notes}</div>}
+            </div>}
+
+            {/* Property fields */}
             <Card>
                 {fields.map((f, i) => <div key={f.key} style={{ padding: '10px 0', borderBottom: i < fields.length - 1 ? `1px solid ${C.hair}` : 'none' }}>
                     <div style={{ fontFamily: F.body, fontSize: 11, color: C.ink3, textTransform: 'uppercase', letterSpacing: .5, fontWeight: 600, marginBottom: 4 }}>{f.label}</div>
                     <input value={pd[f.key] || ''} onChange={e => setF(f.key, e.target.value)} placeholder={f.ph} style={{ width: '100%', border: 'none', background: 'transparent', fontFamily: F.body, fontSize: 15, color: C.ink, fontWeight: 500 }} />
                 </div>)}
             </Card>
+
+            {/* Room sizes — editable, pre-filled from AI if available */}
             <div style={{ marginTop: 14 }}>
-                <Lbl>Rooms in scope</Lbl>
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 7 }}>
-                    {(data.rooms || []).map(r => <div key={r} style={{ padding: '6px 12px', background: C.white, border: `1px solid ${C.hair}`, borderRadius: 100, fontFamily: F.body, fontSize: 13, color: C.ink }}>{ROOM_LBL[r]} · {data.roomSizes?.[r] || ROOM_BASE[r]}m²</div>)}
-                </div>
+                <Lbl>{fp ? 'Room sizes — AI pre-filled, edit if needed' : 'Rooms in scope'}</Lbl>
+                <Card style={{ padding: 0, overflow: 'hidden' }}>
+                    {(data.rooms || []).map((r, i) => {
+                        const sz = data.roomSizes?.[r] || ROOM_BASE[r] || 10;
+                        const aiRoom = fp?.result?.rooms?.find(x => {
+                            if (r === 'kitchen') return x.type === 'kitchen';
+                            if (r === 'living') return x.type === 'living';
+                            if (r === 'bathroom' || r === 'ensuite') return x.type === 'bathroom';
+                            if (r === 'masterBed' || r === 'bed2' || r === 'bed3') return x.type === 'bedroom';
+                            if (r === 'alfresco') return x.type === 'deck';
+                            return false;
+                        });
+                        return <div key={r} style={{ display: 'flex', alignItems: 'center', padding: '11px 16px', borderBottom: i < (data.rooms || []).length - 1 ? `1px solid ${C.hair}` : 'none', gap: 10 }}>
+                            <div style={{ flex: 1 }}>
+                                <div style={{ fontFamily: F.body, fontSize: 14, fontWeight: 500, color: C.ink }}>{ROOM_LBL[r]}</div>
+                                {aiRoom && <div style={{ fontFamily: F.body, fontSize: 11, color: C.green, marginTop: 1 }}>⚡ AI detected {Math.round(aiRoom.area_sqm)} m²</div>}
+                            </div>
+                            <div style={{ display: 'flex', alignItems: 'baseline', gap: 4, background: C.paper, borderRadius: 10, padding: '4px 10px', border: `1px solid ${C.hair}` }}>
+                                <input type="number" value={sz} onChange={e => setSz(r, Math.max(1, parseInt(e.target.value) || 1))} style={{ width: 38, border: 'none', background: 'transparent', fontFamily: F.mono, fontSize: 16, fontWeight: 600, color: C.ink, textAlign: 'right' }} />
+                                <span style={{ fontFamily: F.body, fontSize: 12, color: C.ink3 }}>m²</span>
+                            </div>
+                        </div>;
+                    })}
+                </Card>
             </div>
         </div>
         <BRow><Btn color={C.blue} onClick={onContinue}>Looks right — continue</Btn><Ghost onClick={onBack}>Previous step</Ghost></BRow>
@@ -798,7 +1066,7 @@ export default function BuildEstimator() {
     const [form, setForm] = useState({
         address: '', propertyData: null, projectScope: null,
         rooms: [], roomSizes: {}, finish: 'standard',
-        name: '', email: '', hasDocument: false, docName: '',
+        name: '', email: '', hasDocument: false, docName: '', floorPlanData: null,
         siteConditions: {}, councilData: {}, demoScope: {}, livingSituation: null, structural: {},
     });
     const up = useCallback(p => setForm(f => ({ ...f, ...p })), []);
