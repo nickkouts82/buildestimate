@@ -507,9 +507,10 @@ function S7({ data, onChange, onContinue, onBack }) {
     const [drawing, setDrawing]           = useState(false);
     const [dragStart, setDragStart]       = useState(null);
     const [currentRect, setCurrentRect]   = useState(null);
+    const [fullscreen, setFullscreen]     = useState(false);
 
-    const canvasRef   = useRef(null);
-    const imageRef    = useRef(null);
+    const canvasRef    = useRef(null);
+    const imageRef     = useRef(null);
     const fileInputRef = useRef(null);
 
     const redraw = useCallback(() => {
@@ -539,6 +540,7 @@ function S7({ data, onChange, onContinue, onBack }) {
     }, [rects, currentRect, activeType]);
 
     useEffect(() => { redraw(); }, [redraw]);
+    useEffect(() => { if (imageRef.current) redraw(); }, [fullscreen]); // eslint-disable-line
 
     function canvasPos(e) {
         const c = canvasRef.current; const r = c.getBoundingClientRect();
@@ -661,7 +663,7 @@ function S7({ data, onChange, onContinue, onBack }) {
             </div>}
 
             {/* Phase 2: image loaded — annotation canvas */}
-            {imageUrl && !result && !isLoading && <div>
+            {imageUrl && !result && !isLoading && !fullscreen && <div>
                 {/* Room type chips */}
                 <div style={{ marginBottom: 10 }}>
                     <div style={{ fontFamily: F.body, fontSize: 11, color: C.ink3, textTransform: 'uppercase', letterSpacing: .5, fontWeight: 600, marginBottom: 7 }}>Select room type then draw over it</div>
@@ -670,9 +672,9 @@ function S7({ data, onChange, onContinue, onBack }) {
                     </div>
                 </div>
 
-                {/* Canvas */}
-                <div style={{ borderRadius: 14, overflow: 'hidden', border: `1px solid ${C.hair}`, background: C.white, maxHeight: 260, display: 'flex', alignItems: 'center' }}>
-                    <canvas ref={canvasRef} style={{ width: '100%', height: 'auto', display: 'block', cursor: 'crosshair', touchAction: 'none', maxHeight: 260, objectFit: 'contain' }}
+                {/* Canvas — thumbnail with expand button */}
+                <div style={{ position: 'relative', borderRadius: 14, overflow: 'hidden', border: `1px solid ${C.hair}`, background: C.white }}>
+                    <canvas ref={canvasRef} style={{ width: '100%', height: 'auto', display: 'block', cursor: 'crosshair', touchAction: 'none' }}
                         onMouseDown={e => startDraw(canvasPos(e))}
                         onMouseMove={e => moveDraw(canvasPos(e))}
                         onMouseUp={endDraw} onMouseLeave={endDraw}
@@ -680,6 +682,10 @@ function S7({ data, onChange, onContinue, onBack }) {
                         onTouchMove={e => { e.preventDefault(); moveDraw(touchPos(e)); }}
                         onTouchEnd={endDraw}
                     />
+                    {/* Expand button */}
+                    <div onClick={() => setFullscreen(true)} style={{ position: 'absolute', top: 8, right: 8, width: 34, height: 34, borderRadius: 10, background: 'rgba(14,18,32,.65)', backdropFilter: 'blur(4px)', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer' }}>
+                        <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M10 2h4v4M6 14H2v-4M14 10v4h-4M2 6V2h4" stroke="#fff" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/></svg>
+                    </div>
                 </div>
 
                 {/* Drawn rooms */}
@@ -693,9 +699,49 @@ function S7({ data, onChange, onContinue, onBack }) {
                     })}
                 </div>}
 
-                <div style={{ marginTop: 8, fontFamily: F.body, fontSize: 12, color: C.ink3 }}>Click and drag to mark rooms · Draw one rectangle per room</div>
-                <div onClick={() => fileInputRef.current?.click()} style={{ marginTop: 8, fontFamily: F.body, fontSize: 12, color: C.blue, cursor: 'pointer', fontWeight: 500 }}>Change image</div>
+                <div style={{ marginTop: 8, fontFamily: F.body, fontSize: 12, color: C.ink3 }}>Draw over rooms · tap ⤢ to expand fullscreen</div>
+                <div onClick={() => fileInputRef.current?.click()} style={{ marginTop: 6, fontFamily: F.body, fontSize: 12, color: C.blue, cursor: 'pointer', fontWeight: 500 }}>Change image</div>
                 <input ref={fileInputRef} type="file" accept="image/jpeg,image/png,image/webp" style={{ display: 'none' }} onChange={e => { const f = e.target.files?.[0]; if (f) handleFile(f); }} />
+            </div>}
+
+            {/* Fullscreen annotation overlay */}
+            {fullscreen && <div style={{ position: 'fixed', inset: 0, background: C.ink, zIndex: 200, display: 'flex', flexDirection: 'column' }}>
+                {/* Top bar */}
+                <div style={{ padding: '12px 16px', display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0, borderBottom: `1px solid rgba(255,255,255,.1)` }}>
+                    <div style={{ flex: 1, display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                        {FLOOR_ROOM_TYPES.map(rt => <div key={rt.key} onClick={() => setActiveType(rt.key)} style={{ padding: '5px 10px', borderRadius: 100, border: `1.5px solid ${rt.border}`, background: activeType === rt.key ? rt.border : 'transparent', color: activeType === rt.key ? '#fff' : 'rgba(255,255,255,.8)', fontFamily: F.body, fontSize: 12, fontWeight: 500, cursor: 'pointer', transition: 'all .12s' }}>{rt.label}</div>)}
+                    </div>
+                    <div onClick={() => setFullscreen(false)} style={{ width: 34, height: 34, borderRadius: 10, background: 'rgba(255,255,255,.12)', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', flexShrink: 0 }}>
+                        <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M1 1l12 12M13 1L1 13" stroke="#fff" strokeWidth="2" strokeLinecap="round"/></svg>
+                    </div>
+                </div>
+                {/* Canvas — fills remaining space */}
+                <div style={{ flex: 1, overflow: 'hidden', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 4 }}>
+                    <canvas ref={canvasRef} style={{ maxWidth: '100%', maxHeight: '100%', display: 'block', cursor: 'crosshair', touchAction: 'none', objectFit: 'contain' }}
+                        onMouseDown={e => startDraw(canvasPos(e))}
+                        onMouseMove={e => moveDraw(canvasPos(e))}
+                        onMouseUp={endDraw} onMouseLeave={endDraw}
+                        onTouchStart={e => { e.preventDefault(); startDraw(touchPos(e)); }}
+                        onTouchMove={e => { e.preventDefault(); moveDraw(touchPos(e)); }}
+                        onTouchEnd={endDraw}
+                    />
+                </div>
+                {/* Bottom bar */}
+                <div style={{ padding: '12px 16px', borderTop: `1px solid rgba(255,255,255,.1)`, display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
+                    <div style={{ flex: 1, display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                        {rects.length === 0
+                            ? <div style={{ fontFamily: F.body, fontSize: 13, color: 'rgba(255,255,255,.5)' }}>Select a type above, then drag to mark rooms</div>
+                            : rects.map(r => {
+                                const rt = FLOOR_ROOM_TYPES.find(t => t.key === r.type);
+                                return <div key={r.id} style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '3px 9px', border: `1.5px solid ${rt.border}`, borderRadius: 100, fontFamily: F.body, fontSize: 12, color: '#fff' }}>
+                                    {rt.label}
+                                    <span onClick={() => setRects(prev => prev.filter(x => x.id !== r.id))} style={{ color: 'rgba(255,255,255,.5)', cursor: 'pointer', fontWeight: 600, fontSize: 14, lineHeight: 1 }}>×</span>
+                                </div>;
+                            })
+                        }
+                    </div>
+                    <div onClick={() => setFullscreen(false)} style={{ padding: '9px 18px', borderRadius: 12, background: C.blue, fontFamily: F.display, fontSize: 15, fontWeight: 600, color: '#fff', cursor: 'pointer', flexShrink: 0, boxShadow: `0 4px 14px ${C.blue}50` }}>Done</div>
+                </div>
             </div>}
 
             {/* Phase 3: loading */}
