@@ -13,7 +13,7 @@ echo "=== Building ==="
 npm run build
 
 echo "=== Deploying to ${WEBSERVER_HOST}:${DEPLOY_DIR} ==="
-rsync -avz --delete dist/ ${WEBSERVER_USER}@${WEBSERVER_HOST}:${DEPLOY_DIR}/ -e "ssh ${SSH_OPTS}"
+rsync -avz --delete out/ ${WEBSERVER_USER}@${WEBSERVER_HOST}:${DEPLOY_DIR}/ -e "ssh ${SSH_OPTS}"
 
 echo "=== Reloading nginx ==="
 ssh ${SSH_OPTS} ${WEBSERVER_USER}@${WEBSERVER_HOST} "sudo systemctl reload nginx 2>/dev/null || true"
@@ -26,4 +26,4 @@ RESULT=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_I
 echo "${RESULT}"
 
 echo ""
-echo "=== Done — live at http://buildestimate.32blocks.com ==="
+echo "=== Done — live at https://buildestimate.32blocks.com ==="
